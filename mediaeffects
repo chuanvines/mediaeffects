@@ -1,0 +1,932 @@
+#!/usr/bin/env bash
+# mediaeffects.sh - apply effects to images and videos
+#
+# Install:
+#   curl -fsSL <URL>/mediaeffects.sh -o mediaeffects.sh
+#   bash mediaeffects.sh install
+#   mediaeffects --help
+#
+# Or run directly without installing:
+#   bash mediaeffects.sh in.png out.png --invert --fisheye 1 --hsv 180,0,0
+#
+# Requires: ffmpeg, ffprobe and ImageMagick (magick) on PATH.
+set -euo pipefail
+
+HIDE=0
+INPUT=""
+OUTPUT=""
+FX_TYPES=()
+FX_PARAMS=()
+CLEANUP=""
+
+log() { [ "$HIDE" -eq 0 ] && printf '[mediaeffects] %s\n' "$*"; true; }
+err() { printf 'mediaeffects: error: %s\n' "$*" >&2; exit 1; }
+
+run() {
+    [ "$HIDE" -eq 0 ] && printf '[mediaeffects] exec: %s\n' "$*"
+    "$@" || { err "command failed: $*"; exit 1; }
+}
+
+cleanup() { [ -n "$CLEANUP" ] && rm -rf "$CLEANUP"; true; }
+trap cleanup EXIT
+
+is_num() { [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?([eE][-+]?[0-9]+)?$ ]]; }
+is_csv() { [[ "$1" =~ ^-?[0-9]+(\.[0-9]+)?([,;]-?[0-9]+(\.[0-9]+)?)*$ ]]; }
+is_size() { [[ "$1" =~ ^[0-9]+([xX][0-9]+)?%?$ ]]; }
+
+ext() { printf '%s' "${1##*.}" | tr '[:upper:]' '[:lower:]'; }
+
+is_img() { case "$(ext "$1")" in png|jpg|jpeg|gif) return 0;; esac; return 1; }
+is_vid() { case "$(ext "$1")" in mp4|mov|mxf|mkv|avi) return 0;; esac; return 1; }
+
+fx_name() {
+    case "$1" in
+        invert) echo invert;; invertlum) echo invertlum;; fisheye) echo fisheye;;
+        hsv) echo hsv;; hue) echo hue;; explode) echo explode;; swirl) echo swirl;;
+        hflip) echo hflip;; vflip) echo vflip;; rotate) echo rotate;; magik) echo magik;;
+        haah) echo haah;; waaw) echo waaw;; hooh) echo hooh;; woow) echo woow;;
+        stretch) echo stretch;; resize) echo resize;; derain) echo derain;;
+        rain) echo rain;; bgr) echo bgr;; wave) echo wave;;
+    esac
+}
+
+fx_file() { echo "effects/$(fx_name "$1").c"; }
+
+add_fx() { FX_TYPES+=("$1"); FX_PARAMS+=("${2:-}"); }
+
+uses_ffmpeg() {
+    case "$1" in fisheye|hflip|vflip|rotate|stretch|wave) return 0;; esac
+    return 1
+}
+
+help() {
+    cat <<'EOF'
+mediaeffects - apply effects to images and videos
+
+Usage:
+  mediaeffects <input> <output> [effects...] [options]
+
+Effects:
+  --invert              Negate colors (ffmpeg -vf negate style)
+  --invertlum           Invert luminosity in LAB colorspace
+                        (ImageMagick -colorspace lab -channel r -negate style)
+  --fisheye [strength]  Fisheye distortion, default 0.5 (ffmpeg geq style)
+  --hsv H,S,V           Hue shift in degrees, saturation and value shifts
+                        (0 = no change). e.g. --hsv 180,0,0
+                        (ImageMagick -modulate style)
+  --hue [degrees]       Rotate hue in degrees, default 90 (ImageMagick
+                        -colorspace yuv -fx channel rotation style)
+  --explode [strength]  Explode outward, default 1.0 (-implode style)
+  --swirl [strength]    Swirl in degrees, default 45 (-swirl style)
+  --hflip               Mirror horizontally (ffmpeg -vf hflip)
+  --vflip               Mirror vertically (ffmpeg -vf vflip)
+  --rotate [degrees]    Rotate by degrees, default 90 (ffmpeg -vf rotate)
+  --magik               Liquid-rescale to 50%x50%, then resize 200%
+  --haah                Mirror left half onto right (-crop +clone -flop +append)
+  --waaw                Flop, then mirror left half onto right
+  --hooh                Rotate 90, mirror half, rotate back
+  --woow                Rotate 90 + flop, mirror half, rotate back
+  --stretch [x,y]       Stretch/squeeze horizontally and vertically,
+                        default 1.1,1.1 (ffmpeg geq style)
+                        numbers separated by , or ;
+  --resize [WxH|W|N%]   Resize with ImageMagick, e.g. 1280x720, 500, 50%
+  --derain              Fake derain color trick (ImageMagick colorspace)
+  --rain                Fake rain color trick (ImageMagick colorspace)
+  --bgr                 Swap color channels to BGR (-color-matrix)
+  --wave [params]       Sinusoidal wave distortion (ffmpeg geq style).
+                        params: xfreq,yfreq,xamp,yamp,xphase,yphase[,xspeed,yspeed]
+                        default 3.2,3.2,0.05,0.05,0.628,0.628,0,0
+                        numbers separated by , or ;
+
+Options:
+  --hidelogs            Hide progress logs
+  --help                Show this help and exit
+  install               Copy this script into your PATH (self-install)
+
+Supported formats:
+  Images: .png .jpg .jpeg .gif
+  Videos: .mp4 .mov .mxf .mkv .avi
+
+Videos are processed frame-by-frame through ImageMagick
+(extract frames -> magick -> reassemble with ffmpeg).
+
+Effect source code is generated into the effects/ folder
+(invert.c, invertlum.c, fisheye.c, hsv.c, hue.c, explode.c, swirl.c, hflip.c,
+vflip.c, rotate.c, magik.c).
+
+Examples:
+  mediaeffects in.png out.png --invert
+  mediaeffects in.png out.png --invert --fisheye 1 --hsv 180,0,0
+  mediaeffects clip.mp4 out.mp4 --fisheye 0.5 --hsv 45,20,-10
+EOF
+}
+
+install_me() {
+    local src="$0" dest
+    if [ ! -f "$src" ]; then
+        printf 'mediaeffects: cannot self-install while streaming (curl | bash).\n' >&2
+        printf 'Download it first, then install:\n' >&2
+        printf '  curl -fsSL <URL>/mediaeffects.sh -o mediaeffects.sh\n' >&2
+        printf '  bash mediaeffects.sh install\n' >&2
+        exit 1
+    fi
+    if [ "$(id -u)" -eq 0 ] && [ -d /usr/local/bin ]; then
+        dest=/usr/local/bin/mediaeffects
+    else
+        mkdir -p "$HOME/.local/bin" || true
+        dest="$HOME/.local/bin/mediaeffects"
+    fi
+    cp "$src" "$dest"
+    chmod +x "$dest"
+    printf 'Installed mediaeffects to %s\n' "$dest"
+    printf 'Now run: mediaeffects --help\n'
+}
+
+fisheye_vf() {
+    printf "format=yuv444p16le,geq='p(W*0.5+(X-W*0.5)*max(1-(%s)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0),H*0.5+(Y-H*0.5)*max(1-(%s)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0))',scale=iw:ih,format=yuv420p" "$1" "$1"
+}
+
+effect_vf() {
+    case "$1" in
+        fisheye) fisheye_vf "$2";;
+        hflip) echo hflip;;
+        vflip) echo vflip;;
+        rotate) echo "rotate=${2}*3.141592653589793/180";;
+        stretch) stretch_vf "$2" "$3";;
+        wave) wave_vf "$2" "$3";;
+    esac
+}
+
+# stretch x,y: enlarge the canvas 1.1x, sample with /x and /y, crop back to
+# the input dimensions (dims = "WxH").
+stretch_vf() {
+    local p="$1" dims="$2" x y
+    x=${p%%,*}; y=${p#*,}
+    printf "format=yuv444p,rotate=0:iw*1.1:ih*1.1,geq='p((W/2)+(X-(W/2))/%s,(H/2)+(Y-(H/2))/%s)',scale=iw:ih,crop=%s,format=yuv420p" \
+        "$x" "$y" "${dims//x/:}"
+}
+
+# wave xfreq,yfreq,xamp,yamp,xphase,yphase,xspeed,yspeed: resample to a 640x640
+# square, apply a sinusoidal displacement, then scale back to the input dims.
+wave_vf() {
+    local p="$1" dims="$2" xf yf xa ya xp yp xs ys
+    IFS=, read -r xf yf xa ya xp yp xs ys <<< "$p"
+    printf "format=yuv444p,scale=640:640,geq='p(X-((sin((T*5*%s+(%s))+(Y/H)*(PI*%s)))*(-%s*600)),Y-((sin((T*5*%s+(%s))+(X/W)*(PI*%s)))*(-%s*600)))',scale=%s,format=yuv420p" \
+        "$xs" "$xp" "$xf" "$xa" "$ys" "$yp" "$yf" "$ya" "${dims//x/:}"
+}
+
+# Normalize a wave parameter string to exactly 8 values (missing -> 0).
+pad_wave() {
+    local s="$1"
+    local -a a
+    IFS=, read -r -a a <<< "$s"
+    while [ "${#a[@]}" -lt 8 ]; do a+=("0"); done
+    echo "${a[0]},${a[1]},${a[2]},${a[3]},${a[4]},${a[5]},${a[6]},${a[7]}"
+}
+
+magick_arg() {
+    case "$1" in
+        invert) echo " -negate";;
+        invertlum) echo " -colorspace lab -channel r -negate +colorspace";;
+        hsv)
+            IFS=, read -r h s v <<< "$2"
+            read -r vp sp hp <<< "$(awk -v h="$h" -v s="$s" -v v="$v" \
+                'BEGIN { printf "%d %d %d", 100+v, 100+s, 100 + h*100/180 }')"
+            echo " -modulate $vp,$sp,$hp"
+            ;;
+        hue) echo " -colorspace yuv -fx angle=${2}*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle)) -colorspace srgb";;
+        explode) echo " -implode $(awk -v a="$2" 'BEGIN { printf "%.4f", -a }')";;
+        swirl) echo " -swirl $2";;
+        magik) echo " -liquid-rescale 50%x50% -resize 200%";;
+        haah) echo " -crop 50%x100%+0+0 +repage ( +clone -flop ) +append";;
+        waaw) echo " -flop -crop 50%x100%+0+0 +repage ( +clone -flop ) +append";;
+        hooh) echo " -rotate 90 -crop 50%x100%+0+0 +repage ( +clone -flop ) +append -rotate -90";;
+        woow) echo " -rotate 90 -flop -crop 50%x100%+0+0 +repage ( +clone -flop ) +append -rotate -90";;
+        resize) echo " -resize $2";;
+        derain) echo " -colorspace srgb -set colorspace rgb -colorspace hsv -set colorspace rgb";;
+        rain) echo " -colorspace srgb -set colorspace hsv -colorspace scrgb -set colorspace srgb";;
+        bgr) echo " -color-matrix 0,0,1,0,1,0,1,0,0";;
+    esac
+}
+
+write_effect_c() {
+    local name="$1" p="$2" h s v vp sp hp neg
+    mkdir -p effects
+    case "$name" in
+        invert)
+            cat > effects/invert.c <<'EOF'
+/*
+ * invert.c
+ * Effect      : invert
+ * Description : negate colors
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf negate <output>
+ *
+ * Style reference: ffmpeg negate filter (libavfilter/vf_negate.c)
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string equivalent to: -vf negate */
+const char *const mediaeffects_invert_vf = "negate";
+
+/* pixel-level operation: out = max - in */
+static unsigned int mediaeffects_invert_pixel(unsigned int v, unsigned int max)
+{
+    return max - v;
+}
+EOF
+            ;;
+        invertlum)
+            cat > effects/invertlum.c <<'EOF'
+/*
+ * invertlum.c
+ * Effect      : invertlum
+ * Description : invert luminosity in LAB colorspace
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -colorspace lab -channel r -negate +colorspace <output>
+ *
+ * Style reference: ImageMagick -colorspace, -channel, -negate
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (negate the L channel of LAB) */
+const char *const mediaeffects_invertlum_magick = "-colorspace lab -channel r -negate +colorspace";
+EOF
+            ;;
+        fisheye)
+            cat > effects/fisheye.c <<EOF
+/*
+ * fisheye.c
+ * Effect      : fisheye
+ * Strength    : $p
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf format=yuv444p16le,"geq='...'",scale=iw:ih,format=yuv420p <output>
+ *
+ * Style reference: ffmpeg geq filter (libavfilter/vf_geq.c)
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string; samples source pixels via p(x,y) */
+const char *const mediaeffects_fisheye_vf =
+    "format=yuv444p16le,"
+    "geq='p(W*0.5+(X-W*0.5)*max(1-($p)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0),"
+    "H*0.5+(Y-H*0.5)*max(1-($p)*gauss(-3.3333*pow(hypot((X-W*0.5)/(W*0.5),(Y-H*0.5)/(H*0.5)),2)),0))',"
+    "scale=iw:ih,format=yuv420p";
+EOF
+            ;;
+        hsv)
+            IFS=, read -r h s v <<< "$p"
+            read -r vp sp hp <<< "$(awk -v h="$h" -v s="$s" -v v="$v" \
+                'BEGIN { printf "%d %d %d", 100+v, 100+s, 100 + h*100/180 }')"
+            cat > effects/hsv.c <<EOF
+/*
+ * hsv.c
+ * Effect      : hsv
+ * Hue         : $h deg shift (no change: 0)
+ * Saturation  : $s shift (no change: 0)
+ * Value       : $v shift (no change: 0)
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -modulate $vp,$sp,$hp <output>
+ *
+ * Style reference: ImageMagick -modulate brightness,saturation,hue
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (brightness,saturation,hue percent) */
+const char *const mediaeffects_hsv_magick = "-modulate $vp,$sp,$hp";
+EOF
+            ;;
+        hue)
+            cat > effects/hue.c <<EOF
+/*
+ * hue.c
+ * Effect      : hue
+ * Angle       : $p degrees
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -colorspace yuv -fx "angle=$p*pi/180; channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))" -colorspace srgb <output>
+ *
+ * Style reference: ImageMagick -colorspace, -fx channel rotation
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (rotate UV chroma around luma) */
+const char *const mediaeffects_hue_magick =
+    "-colorspace yuv -fx \"angle=$p*pi/180; channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))\" -colorspace srgb";
+EOF
+            ;;
+        explode)
+            neg=$(awk -v a="$p" 'BEGIN { printf "%.4f", -a }')
+            cat > effects/explode.c <<EOF
+/*
+ * explode.c
+ * Effect      : explode
+ * Strength    : $p
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -implode $neg <output>
+ *
+ * Style reference: ImageMagick -implode (negative = explode)
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (strength is negated for explode) */
+const char *const mediaeffects_explode_magick = "-implode $neg";
+EOF
+            ;;
+        swirl)
+            cat > effects/swirl.c <<EOF
+/*
+ * swirl.c
+ * Effect      : swirl
+ * Strength    : $p degrees
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -swirl $p <output>
+ *
+ * Style reference: ImageMagick -swirl
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_swirl_magick = "-swirl $p";
+EOF
+            ;;
+        hflip)
+            cat > effects/hflip.c <<'EOF'
+/*
+ * hflip.c
+ * Effect      : hflip
+ * Description : mirror horizontally
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf hflip <output>
+ *
+ * Style reference: ffmpeg hflip filter (libavfilter/vf_hflip.c)
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string equivalent to: -vf hflip */
+const char *const mediaeffects_hflip_vf = "hflip";
+EOF
+            ;;
+        vflip)
+            cat > effects/vflip.c <<'EOF'
+/*
+ * vflip.c
+ * Effect      : vflip
+ * Description : mirror vertically
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf vflip <output>
+ *
+ * Style reference: ffmpeg vflip filter (libavfilter/vf_vflip.c)
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string equivalent to: -vf vflip */
+const char *const mediaeffects_vflip_vf = "vflip";
+EOF
+            ;;
+        rotate)
+            cat > effects/rotate.c <<EOF
+/*
+ * rotate.c
+ * Effect      : rotate
+ * Angle       : $p degrees (counter-clockwise)
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf rotate=${p}*3.141592653589793/180 <output>
+ *
+ * Style reference: ffmpeg rotate filter (libavfilter/vf_rotate.c)
+ *
+ * Note: ffmpeg rotate takes radians; degrees are converted as deg*PI/180.
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string (angle in radians) */
+const char *const mediaeffects_rotate_vf = "rotate=${p}*3.141592653589793/180";
+EOF
+            ;;
+        magik)
+            cat > effects/magik.c <<'EOF'
+/*
+ * magik.c
+ * Effect      : magik
+ * Description : liquid rescale to 50% x 50%, then resize 200%
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -liquid-rescale 50%x50% -resize 200% <output>
+ *
+ * Style reference: ImageMagick -liquid-rescale, -resize
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_magik_magick = "-liquid-rescale 50%x50% -resize 200%";
+EOF
+            ;;
+        haah)
+            cat > effects/haah.c <<'EOF'
+/*
+ * haah.c
+ * Effect      : haah
+ * Description : mirror left half onto the right
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -crop 50%x100%+0+0 +repage ( +clone -flop ) +append <output>
+ *
+ * Style reference: ImageMagick -crop, +clone, -flop, +append
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_haah_magick = "-crop 50%x100%+0+0 +repage ( +clone -flop ) +append";
+EOF
+            ;;
+        waaw)
+            cat > effects/waaw.c <<'EOF'
+/*
+ * waaw.c
+ * Effect      : waaw
+ * Description : flop, then mirror left half onto the right
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -flop -crop 50%x100%+0+0 +repage ( +clone -flop ) +append <output>
+ *
+ * Style reference: ImageMagick -flop, -crop, +clone, -flop, +append
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_waaw_magick = "-flop -crop 50%x100%+0+0 +repage ( +clone -flop ) +append";
+EOF
+            ;;
+        hooh)
+            cat > effects/hooh.c <<'EOF'
+/*
+ * hooh.c
+ * Effect      : hooh
+ * Description : rotate 90, mirror half, rotate back
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -rotate 90 -crop 50%x100%+0+0 +repage ( +clone -flop ) +append -rotate -90 <output>
+ *
+ * Style reference: ImageMagick -rotate, -crop, +clone, -flop, +append
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_hooh_magick = "-rotate 90 -crop 50%x100%+0+0 +repage ( +clone -flop ) +append -rotate -90";
+EOF
+            ;;
+        woow)
+            cat > effects/woow.c <<'EOF'
+/*
+ * woow.c
+ * Effect      : woow
+ * Description : rotate 90 + flop, mirror half, rotate back
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -rotate 90 -flop -crop 50%x100%+0+0 +repage ( +clone -flop ) +append -rotate -90 <output>
+ *
+ * Style reference: ImageMagick -rotate, -flop, -crop, +clone, -flop, +append
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_woow_magick = "-rotate 90 -flop -crop 50%x100%+0+0 +repage ( +clone -flop ) +append -rotate -90";
+EOF
+            ;;
+        stretch)
+            cat > effects/stretch.c <<'EOF'
+/*
+ * stretch.c
+ * Effect      : stretch
+ * Description : stretch/squeeze horizontally and vertically
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf format=yuv444p,rotate=0:iw*1.1:ih*1.1,"geq='p((W/2)+(X-(W/2))/<x>,(H/2)+(Y-(H/2))/<y>)'",scale=iw:ih,crop=<w>:<h>,format=yuv420p <output>
+ *
+ * Style reference: ffmpeg geq filter
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string (x,y scale factors; crop to original <w>x<h>) */
+const char *const mediaeffects_stretch_vf =
+    "format=yuv444p,rotate=0:iw*1.1:ih*1.1,"
+    "geq='p((W/2)+(X-(W/2))/<x>,(H/2)+(Y-(H/2))/<y>)',scale=iw:ih,crop=<w>:<h>,format=yuv420p";
+EOF
+            ;;
+        resize)
+            cat > effects/resize.c <<EOF
+/*
+ * resize.c
+ * Effect      : resize
+ * Size        : $p
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -resize $p <output>
+ *
+ * Style reference: ImageMagick -resize
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_resize_magick = "-resize $p";
+EOF
+            ;;
+        derain)
+            cat > effects/derain.c <<'EOF'
+/*
+ * derain.c
+ * Effect      : derain
+ * Description : fake derain color trick
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -colorspace srgb -set colorspace rgb -colorspace hsv -set colorspace rgb <output>
+ *
+ * Style reference: ImageMagick -colorspace, -set colorspace
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_derain_magick = "-colorspace srgb -set colorspace rgb -colorspace hsv -set colorspace rgb";
+EOF
+            ;;
+        rain)
+            cat > effects/rain.c <<'EOF'
+/*
+ * rain.c
+ * Effect      : rain
+ * Description : fake rain color trick
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -colorspace srgb -set colorspace hsv -colorspace scrgb -set colorspace srgb <output>
+ *
+ * Style reference: ImageMagick -colorspace, -set colorspace
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string */
+const char *const mediaeffects_rain_magick = "-colorspace srgb -set colorspace hsv -colorspace scrgb -set colorspace srgb";
+EOF
+            ;;
+        bgr)
+            cat > effects/bgr.c <<'EOF'
+/*
+ * bgr.c
+ * Effect      : bgr
+ * Description : swap color channels to BGR
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   magick <input> -color-matrix "0 0 1 0 1 0 1 0 0" <output>
+ *
+ * Style reference: ImageMagick -color-matrix
+ */
+
+#include <stddef.h>
+
+/* ImageMagick option string (comma-separated so it stays a single arg) */
+const char *const mediaeffects_bgr_magick = "-color-matrix 0,0,1,0,1,0,1,0,0";
+EOF
+            ;;
+        wave)
+            cat > effects/wave.c <<EOF
+/*
+ * wave.c
+ * Effect      : wave
+ * Params      : $p
+ * Generated by: mediaeffects
+ *
+ * CLI equivalent:
+ *   ffmpeg -i <input> -vf format=yuv444p,scale=640:640,"geq='p(X-((sin((T*5*<xs>+(<xp>))+(Y/H)*(PI*<xf>)))*(-<xa>*600)),Y-((sin((T*5*<ys>+(<yp>))+(X/W)*(PI*<yf>)))*(-<ya>*600)))'",scale=<w>:<h>,format=yuv420p <output>
+ *
+ * Style reference: ffmpeg geq filter
+ */
+
+#include <stddef.h>
+
+/* ffmpeg filter string (xfreq,yfreq,xamp,yamp,xphase,yphase,xspeed,yspeed) */
+const char *const mediaeffects_wave_vf =
+    "format=yuv444p,scale=640:640,"
+    "geq='p(X-((sin((T*5*<xs>+(<xp>))+(Y/H)*(PI*<xf>)))*(-<xa>*600)),"
+    "Y-((sin((T*5*<ys>+(<yp>))+(X/W)*(PI*<yf>)))*(-<ya>*600)))',"
+    "scale=<w>:<h>,format=yuv420p";
+EOF
+            ;;
+    esac
+    log "effect: $(fx_name "$name") -> $(fx_file "$name")"
+}
+
+run_fx_image() {
+    local type="$1" p="$2" in="$3" out="$4" h s v vp sp hp
+    case "$type" in
+        invert) run magick "$in" -negate "$out";;
+        invertlum) run magick "$in" -colorspace lab -channel r -negate +colorspace "$out";;
+        fisheye) run ffmpeg -y -v error -i "$in" -vf "$(fisheye_vf "$p")" "$out";;
+        hsv)
+            IFS=, read -r h s v <<< "$p"
+            read -r vp sp hp <<< "$(awk -v h="$h" -v s="$s" -v v="$v" \
+                'BEGIN { printf "%d %d %d", 100+v, 100+s, 100 + h*100/180 }')"
+            run magick "$in" -modulate "$vp,$sp,$hp" "$out"
+            ;;
+        hue) run magick "$in" -colorspace yuv -fx "angle=${p}*pi/180; channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))" -colorspace srgb "$out";;
+        explode) run magick "$in" -implode "$(awk -v a="$p" 'BEGIN { printf "%.4f", -a }')" "$out";;
+        swirl) run magick "$in" -swirl "$p" "$out";;
+        hflip) run ffmpeg -y -v error -i "$in" -vf hflip "$out";;
+        vflip) run ffmpeg -y -v error -i "$in" -vf vflip "$out";;
+        rotate) run ffmpeg -y -v error -i "$in" -vf "rotate=${p}*3.141592653589793/180" "$out";;
+        magik) run magick "$in" -liquid-rescale 50%x50% -resize 200% "$out";;
+        haah) run magick "$in" -crop 50%x100%+0+0 +repage \( +clone -flop \) +append "$out";;
+        waaw) run magick "$in" -flop -crop 50%x100%+0+0 +repage \( +clone -flop \) +append "$out";;
+        hooh) run magick "$in" -rotate 90 -crop 50%x100%+0+0 +repage \( +clone -flop \) +append -rotate -90 "$out";;
+        woow) run magick "$in" -rotate 90 -flop -crop 50%x100%+0+0 +repage \( +clone -flop \) +append -rotate -90 "$out";;
+        stretch) run ffmpeg -y -v error -i "$in" -vf "$(stretch_vf "$p" "$(magick "$in" -format '%wx%h' info:)")" "$out";;
+        wave) run ffmpeg -y -v error -i "$in" -vf "$(wave_vf "$p" "$(magick "$in" -format '%wx%h' info:)")" "$out";;
+        resize) run magick "$in" -resize "$p" "$out";;
+        derain) run magick "$in" -colorspace srgb -set colorspace rgb -colorspace hsv -set colorspace rgb "$out";;
+        rain) run magick "$in" -colorspace srgb -set colorspace hsv -colorspace scrgb -set colorspace srgb "$out";;
+        bgr) run magick "$in" -color-matrix 0,0,1,0,1,0,1,0,0 "$out";;
+    esac
+}
+
+process_image() {
+    local n=${#FX_TYPES[@]} i in="$INPUT" out
+    if [ "$n" -eq 0 ]; then
+        run magick "$INPUT" "$OUTPUT"
+        return
+    fi
+    CLEANUP=$(mktemp -d)
+    for ((i = 0; i < n; i++)); do
+        if [ "$i" -eq $((n - 1)) ]; then out="$OUTPUT"; else out="$CLEANUP/fx_$i.png"; fi
+        log "processing: ${FX_TYPES[$i]} (pass $((i + 1))/$n)"
+        run_fx_image "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}" "$in" "$out"
+        in="$out"
+    done
+}
+
+get_video_fps() {
+    local fps
+    fps=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate \
+          -of csv=p=0 -i "$1" 2>/dev/null || true)
+    case "$fps" in "" | "0/0") echo 25;; *) echo "$fps";; esac
+}
+
+video_pass_magick() {
+    local dir="$1" cur="$2" next="$3" args="$4" d="$1" nframes cores chunk hi start pid status=0 i num
+    local -a pids=()
+    # On MSYS2/Git Bash, native magick.exe cannot open POSIX /tmp paths, so
+    # convert to a Windows path when cygpath is available (Linux passes through).
+    if command -v cygpath >/dev/null 2>&1; then
+        d=$(cygpath -w "$dir")
+    fi
+    nframes=$(ls "$dir/${cur}_"*.jpg 2>/dev/null | wc -l)
+    if [ "$nframes" -le 1 ]; then
+        # shellcheck disable=SC2086
+        run magick "$d/${cur}_*.jpg" $args "$d/${next}_%05d.jpg"
+        return
+    fi
+    cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+    [ "$cores" -gt "$nframes" ] && cores=$nframes
+    chunk=$(( (nframes + cores - 1) / cores ))
+    if [[ "$args" == *"+append"* ]]; then
+        # Mirror effects use +append/+clone which collapse a multi-frame
+        # sequence into a single image, so apply them frame by frame.
+        for ((start = 0; start < nframes; start += chunk)); do
+            hi=$(( start + chunk - 1 ))
+            [ "$hi" -ge "$nframes" ] && hi=$(( nframes - 1 ))
+            (
+                for ((i = start; i <= hi; i++)); do
+                    num=$(printf '%05d' "$i")
+                    # shellcheck disable=SC2086
+                    magick "$d/${cur}_${num}.jpg" $args "$d/${next}_${num}.jpg" || exit 1
+                done
+            ) &
+            pids+=("$!")
+        done
+    else
+        # Process disjoint frame ranges in parallel; -scene keeps the output
+        # numbering aligned with each chunk's starting frame.
+        for ((start = 0; start < nframes; start += chunk)); do
+            hi=$(( start + chunk - 1 ))
+            [ "$hi" -ge "$nframes" ] && hi=$(( nframes - 1 ))
+            # shellcheck disable=SC2086
+            magick "$d/${cur}_%05d.jpg[$start-$hi]" $args -scene "$start" \
+                "$d/${next}_%05d.jpg" &
+            pids+=("$!")
+        done
+    fi
+    for pid in "${pids[@]}"; do
+        wait "$pid" || status=1
+    done
+    [ "$status" -eq 0 ] || err "magick frame pass failed"
+}
+
+video_pass_ffmpeg() {
+    local dir="$1" cur="$2" next="$3" vf="$4"
+    run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.jpg" -vf "$vf" \
+        -start_number 0 "$dir/${next}_%05d.jpg"
+}
+
+process_video() {
+    local dir fps dims cur=f next magick_args="" pending=0 n=${#FX_TYPES[@]} i
+    if [ "$n" -eq 0 ]; then
+        run ffmpeg -y -v error -i "$INPUT" -map 0:v -map 0:a? -c copy "$OUTPUT"
+        return
+    fi
+    command -v ffprobe >/dev/null || err "ffprobe not found on PATH (needed for video)"
+    CLEANUP=$(mktemp -d)
+    dir="$CLEANUP"
+    run ffmpeg -y -v error -i "$INPUT" -map 0:v -start_number 0 -c:v mjpeg -q:v 2 \
+        "$dir/f_%05d.jpg"
+    fps=$(get_video_fps "$INPUT")
+    dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+           -of csv=s=x:p=0 "$INPUT")
+
+    for ((i = 0; i < n; i++)); do
+        if uses_ffmpeg "${FX_TYPES[$i]}"; then
+            if [ "$pending" -eq 1 ]; then
+                next=$( [ "$cur" = a ] && echo b || echo a )
+                video_pass_magick "$dir" "$cur" "$next" "$magick_args"
+                cur="$next"
+                magick_args=""
+                pending=0
+            fi
+            next=$( [ "$cur" = a ] && echo b || echo a )
+            log "processing: ${FX_TYPES[$i]} (pass $((i + 1))/$n)"
+            video_pass_ffmpeg "$dir" "$cur" "$next" "$(effect_vf "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}" "$dims")"
+            cur="$next"
+        else
+            magick_args="${magick_args}$(magick_arg "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}")"
+            pending=1
+        fi
+    done
+    if [ "$pending" -eq 1 ]; then
+        next=$( [ "$cur" = a ] && echo b || echo a )
+        video_pass_magick "$dir" "$cur" "$next" "$magick_args"
+        cur="$next"
+    fi
+
+    run ffmpeg -y -v error -r "$fps" -start_number 0 -i "$dir/${cur}_%05d.jpg" \
+        -i "$INPUT" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset faster \
+        -pix_fmt yuv420p -c:a aac -b:a 128k "$OUTPUT"
+}
+
+parse_args() {
+    local p
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --help|-h) help; exit 0;;
+            --hidelogs) HIDE=1; shift;;
+            --invert) add_fx invert; shift;;
+            --invertlum) add_fx invertlum; shift;;
+            --fisheye)
+                shift; p=0.5
+                if [ $# -gt 0 ] && is_num "$1"; then p=$1; shift; fi
+                add_fx fisheye "$p"
+                ;;
+            --explode)
+                shift; p=1.0
+                if [ $# -gt 0 ] && is_num "$1"; then p=$1; shift; fi
+                add_fx explode "$p"
+                ;;
+            --swirl)
+                shift; p=45
+                if [ $# -gt 0 ] && is_num "$1"; then p=$1; shift; fi
+                add_fx swirl "$p"
+                ;;
+            --rotate)
+                shift; p=90
+                if [ $# -gt 0 ] && is_num "$1"; then p=$1; shift; fi
+                add_fx rotate "$p"
+                ;;
+            --hsv)
+                shift
+                [ $# -eq 0 ] && err "'--hsv' requires a value like 180,0,0"
+                add_fx hsv "$1"; shift
+                ;;
+            --hue)
+                shift; p=90
+                if [ $# -gt 0 ] && is_num "$1"; then p=$1; shift; fi
+                add_fx hue "$p"
+                ;;
+            --hflip) add_fx hflip; shift;;
+            --vflip) add_fx vflip; shift;;
+            --magik) add_fx magik; shift;;
+            --haah) add_fx haah; shift;;
+            --waaw) add_fx waaw; shift;;
+            --hooh) add_fx hooh; shift;;
+            --woow) add_fx woow; shift;;
+            --derain) add_fx derain; shift;;
+            --rain) add_fx rain; shift;;
+            --bgr) add_fx bgr; shift;;
+            --stretch)
+                shift; p="1.1,1.1"
+                if [ $# -gt 0 ] && is_csv "$1"; then p=${1//;/,}; shift; fi
+                if [[ "$p" != *,* ]]; then p="$p,$p"; fi
+                add_fx stretch "$p"
+                ;;
+            --resize)
+                shift
+                [ $# -eq 0 ] && err "'--resize' requires a size like 1280x720, 500 or 50%"
+                is_size "$1" || err "'--resize' requires a size like 1280x720, 500 or 50%"
+                add_fx resize "$1"; shift
+                ;;
+            --wave)
+                shift; p="3.2,3.2,0.05,0.05,0.628,0.628,0,0"
+                if [ $# -gt 0 ] && is_csv "$1"; then p=$(pad_wave "${1//;/,}"); shift; fi
+                add_fx wave "$p"
+                ;;
+            --*|-*) err "unknown option '$1' (see --help)";;
+            *)
+                if [ -z "$INPUT" ]; then
+                    INPUT=$1
+                elif [ -z "$OUTPUT" ]; then
+                    OUTPUT=$1
+                else
+                    err "unexpected argument '$1' (see --help)"
+                fi
+                shift
+                ;;
+        esac
+    done
+}
+
+main() {
+    if [ "${1:-}" = install ] || [ "${1:-}" = --install ]; then
+        install_me
+        exit 0
+    fi
+    parse_args "$@"
+
+    [ -n "$INPUT" ] && [ -n "$OUTPUT" ] || { help; err "missing input or output file"; }
+    [ "$INPUT" != "$OUTPUT" ] || err "input and output are the same file: $INPUT"
+    [ -f "$INPUT" ] || err "input file not found or unreadable: $INPUT"
+
+    is_img "$INPUT" || is_vid "$INPUT" || err "unsupported input format .$(ext "$INPUT")"
+    is_img "$OUTPUT" || is_vid "$OUTPUT" || err "unsupported output format .$(ext "$OUTPUT")"
+
+    command -v magick >/dev/null || err "ImageMagick 'magick' not found on PATH"
+    command -v ffmpeg >/dev/null || err "ffmpeg not found on PATH"
+
+    log "input : $INPUT"
+    log "output: $OUTPUT"
+
+    local i
+    for ((i = 0; i < ${#FX_TYPES[@]}; i++)); do
+        write_effect_c "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}"
+    done
+
+    if is_img "$INPUT"; then
+        process_image
+    else
+        process_video
+    fi
+    log "done: $OUTPUT"
+}
+
+main "$@"
