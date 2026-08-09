@@ -104,9 +104,9 @@ Each run writes the generated effect code into the **`effects/`** folder as C so
 
 ## icf+ code example:
 
-.t icf+ 10 0.4 - mov mp4 -qp 1 -c:a pcm_s16le a$i.mp4
+.t icf+ 10 0.4 - mov mp4 -qp 1 -c:a pcm_s16le a$i.mp4 
 curl -sS -o mediaeffects "https""://raw.githubusercontent.com/chuanvines/mediaeffects/refs/heads/main/mediaeffects"
-chmod +x mediaeffects
-ffmpeg -i a$i.mp4 -af atempo=1 h$i.mp4
-./mediaeffects --hidelogs h$i.mp4 out$i.mp4 --bgr --hue 100 --haah --wave "3.2,3.2,0.05,0.05,0.628,0.628"
+chmod +x mediaeffects 
+ffmpeg -i a$i.mp4 -af atempo=1 h$i.mp4 
+./mediaeffects --hidelogs h$i.mp4 out$i.mp4 --bgr --hue 100 --haah --wave "3.2,3.2,0.05,0.05,0.628,0.628" 
 ffmpeg -i out$i.mp4 -c:a aac -preset ultrafast -qp 1 -c:a pcm_s16le
