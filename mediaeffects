@@ -112,8 +112,8 @@ Supported formats:
 
 Videos whose effects are all expressible as ffmpeg filters are encoded in a
 single pass with no intermediate files. When ImageMagick is required, frames
-are extracted as PNG (lossless), processed in parallel chunks, and reassembled
-with ffmpeg.
+are extracted as lossless JPEG 2000 (.jp2), processed in parallel chunks, and
+reassembled with ffmpeg.
 
 Effect source code is generated into the effects/ folder
 (invert.c, invertlum.c, fisheye.c, hsv.c, hue.c, explode.c, swirl.c, hflip.c,
@@ -752,30 +752,60 @@ get_video_fps() {
 }
 
 video_pass_magick() {
-    local dir="$1" cur="$2" next="$3" args="$4" d="$1" nframes cores chunk hi start pid status=0
-    local -a pids=()
+    local dir="$1" cur="$2" next="$3" args="$4" d="$1" nframes cores chunk hi start pid f status=0
+    local -a pids=() files
     # On MSYS2/Git Bash, native magick.exe cannot open POSIX /tmp paths, so
     # convert to a Windows path when cygpath is available (Linux passes through).
     if command -v cygpath >/dev/null 2>&1; then
         d=$(cygpath -w "$dir")
     fi
-    nframes=$(ls "$dir/${cur}_"*.png 2>/dev/null | wc -l)
+    nframes=$(ls "$dir/${cur}_"*.jp2 2>/dev/null | wc -l)
     if [ "$nframes" -le 1 ]; then
         # shellcheck disable=SC2086
-        run magick "$d/${cur}_*.png" $args -define png:compression-level=1 "$d/${next}_%05d.png"
+        run magick "$d/${cur}_*.jp2" $args -quality 100 "$d/${next}_%05d.jp2"
         return
     fi
     cores=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
     [ "$cores" -gt "$nframes" ] && cores=$nframes
+    if [[ "$args" == *-fx* ]]; then
+        # The -fx operator collapses any input sequence to a single output
+        # image, so an fx-based segment (e.g. hue) must run one magick per
+        # frame. Keep the parallel structure by processing frames in waves of
+        # at most $cores.
+        for ((start = 0; start < nframes; start += cores)); do
+            hi=$(( start + cores - 1 ))
+            [ "$hi" -ge "$nframes" ] && hi=$(( nframes - 1 ))
+            pids=()
+            for ((f = start; f <= hi; f++)); do
+                ff=$(printf '%05d' "$f")
+                # shellcheck disable=SC2086
+                magick "$d/${cur}_${ff}.jp2" $args -quality 100 -scene "$f" \
+                    "$d/${next}_%05d.jp2" &
+                pids+=("$!")
+            done
+            for pid in "${pids[@]}"; do wait "$pid" || status=1; done
+        done
+        [ "$status" -eq 0 ] || err "magick frame pass failed"
+        return
+    fi
     chunk=$(( (nframes + cores - 1) / cores ))
+    # JPEG 2000 does not support ImageMagick [N-M] frame ranges (they are read
+    # as tile indices), so each chunk's frames are passed as an explicit file
+    # list. Shrink the chunk if the list would overflow the command line.
+    while [ "$chunk" -gt 1 ] && [ $(( chunk * ( ${#dir} + ${#cur} + 40 ) + ${#args} )) -gt 28000 ]; do
+        chunk=$(( (chunk + 1) / 2 ))
+    done
     # Process disjoint frame ranges in parallel; -scene keeps the output
     # numbering aligned with each chunk's starting frame.
     for ((start = 0; start < nframes; start += chunk)); do
         hi=$(( start + chunk - 1 ))
         [ "$hi" -ge "$nframes" ] && hi=$(( nframes - 1 ))
+        files=()
+        for ((f = start; f <= hi; f++)); do
+            files+=("$d/${cur}_$(printf '%05d' "$f").jp2")
+        done
         # shellcheck disable=SC2086
-        magick "$d/${cur}_%05d.png[$start-$hi]" $args -define png:compression-level=1 \
-            -scene "$start" "$d/${next}_%05d.png" &
+        magick "${files[@]}" $args -quality 100 -scene "$start" "$d/${next}_%05d.jp2" &
         pids+=("$!")
     done
     for pid in "${pids[@]}"; do
@@ -786,8 +816,8 @@ video_pass_magick() {
 
 video_pass_ffmpeg() {
     local dir="$1" cur="$2" next="$3" vf="$4"
-    run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.png" -vf "$vf" \
-        -start_number 0 "$dir/${next}_%05d.png"
+    run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.jp2" -vf "$vf" \
+        -c:v jpeg2000 -compression_level 0 -start_number 0 "$dir/${next}_%05d.jp2"
 }
 
 process_video() {
@@ -813,8 +843,8 @@ process_video() {
 
     CLEANUP=$(mktemp -d)
     dir="$CLEANUP"
-    run ffmpeg -y -v error -i "$INPUT" -map 0:v -start_number 0 -c:v png \
-        "$dir/f_%05d.png"
+    run ffmpeg -y -v error -i "$INPUT" -map 0:v -start_number 0 -c:v jpeg2000 -compression_level 0 \
+        "$dir/f_%05d.jp2"
     fps=$(get_video_fps "$INPUT")
 
     for ((i = 0; i < ns; i++)); do
@@ -828,7 +858,7 @@ process_video() {
         cur="$next"
     done
 
-    run ffmpeg -y -v error -r "$fps" -start_number 0 -i "$dir/${cur}_%05d.png" \
+    run ffmpeg -y -v error -r "$fps" -start_number 0 -i "$dir/${cur}_%05d.jp2" \
         -i "$INPUT" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast \
         -pix_fmt yuv420p -c:a aac -b:a 128k "$OUTPUT"
 }
