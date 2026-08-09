@@ -101,3 +101,7 @@ Note: self-install only works when the script is saved as a file (not when piped
 ## Effect source generation
 
 Each run writes the generated effect code into the **`effects/`** folder as C source files (`invert.c`, `fisheye.c`, `hsv.c`, `hue.c`, `explode.c`, `swirl.c`, `hflip.c`, `vflip.c`, `rotate.c`, `magik.c`, `haah.c`, `waaw.c`, `hooh.c`, `woow.c`, `stretch.c`, `resize.c`, `derain.c`, `rain.c`, `bgr.c`, `wave.c`). These document the exact ffmpeg/ImageMagick command each effect expands to.
+
+## icf+ code example:
+
+
