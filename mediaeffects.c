@@ -9,9 +9,9 @@
  *
  * Videos whose effects are all expressible as ffmpeg filters are encoded in a
  * single pass with no intermediate frames. When ImageMagick is required, frames
- * are extracted as PNG (lossless, so effects never degrade quality), ImageMagick
- * runs on disjoint frame ranges in parallel, and the frames are reassembled with
- * ffmpeg.
+ * are extracted as lossless JPEG 2000 (.jp2, so effects never degrade quality),
+ * ImageMagick runs on disjoint frame ranges in parallel, and the frames are
+ * reassembled with ffmpeg.
  */
 #include <windows.h>
 #include <stdio.h>
@@ -497,7 +497,7 @@ static int count_frames(const char *dir, const char *cur) {
     WIN32_FIND_DATAA fd;
     char pat[MAX_PATH];
     int count = 0;
-    _snprintf(pat, sizeof(pat), "%s\\%s_*.png", dir, cur);
+    _snprintf(pat, sizeof(pat), "%s\\%s_*.jp2", dir, cur);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     do {
@@ -508,13 +508,16 @@ static int count_frames(const char *dir, const char *cur) {
 }
 
 /* Run ImageMagick on disjoint frame ranges in parallel; -scene keeps the
- * output numbering aligned with each chunk's starting frame. */
+ * output numbering aligned with each chunk's starting frame. JPEG 2000 does
+ * not support ImageMagick [N-M] frame ranges (they are read as tile indices),
+ * so each chunk's frames are passed as an explicit file list instead. */
 static void video_pass_magick(const char *dir, const char *cur, const char *next,
                               const char *args) {
-    int nframes, cores, chunk, start, n, i;
+    int nframes, cores, chunk, start, n, i, f;
+    size_t per, cap;
     nframes = count_frames(dir, cur);
     if (nframes <= 1) {
-        run("magick \"%s\\%s_*.png\" %s -define png:compression-level=1 \"%s\\%s_%%05d.png\"", dir, cur, args, dir, next);
+        run("magick \"%s\\%s_*.jp2\" %s -quality 100 \"%s\\%s_%%05d.jp2\"", dir, cur, args, dir, next);
         return;
     }
     {
@@ -525,6 +528,56 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
     if (cores < 1) cores = 1;
     if (cores > nframes) cores = nframes;
     chunk = (nframes + cores - 1) / cores;
+    /* The -fx operator collapses any input sequence to a single output image,
+     * so an fx-based segment (e.g. hue) must run one magick process per frame.
+     * Keep the parallel structure by processing frames in waves of `cores`. */
+    if (strstr(args, "-fx")) {
+        int start, hi, k, m;
+        for (start = 0; start < nframes; start += cores) {
+            hi = start + cores - 1;
+            if (hi >= nframes) hi = nframes - 1;
+            m = hi - start + 1;
+            HANDLE *fxh = malloc(sizeof(HANDLE) * (size_t)m);
+            char **fxc = malloc(sizeof(char *) * (size_t)m);
+            for (k = start; k <= hi; k++) {
+                cap = strlen(dir) + strlen(cur) + strlen(args) + strlen(next) + 128;
+                fxc[k - start] = malloc(cap);
+                _snprintf(fxc[k - start], cap,
+                          "magick \"%s\\%s_%05d.jp2\" %s -quality 100 -scene %d "
+                          "\"%s\\%s_%%05d.jp2\"",
+                          dir, cur, k, args, k, dir, next);
+                if (!hide) printf("[mediaeffects] exec: %s\n", fxc[k - start]);
+                STARTUPINFOA si0;
+                PROCESS_INFORMATION pi;
+                memset(&si0, 0, sizeof(si0));
+                si0.cb = sizeof(si0);
+                memset(&pi, 0, sizeof(pi));
+                if (CreateProcessA(NULL, fxc[k - start], NULL, NULL, FALSE,
+                                   CREATE_NO_WINDOW, NULL, NULL, &si0, &pi))
+                    fxh[k - start] = pi.hProcess;
+                else
+                    fxh[k - start] = NULL;
+            }
+            for (k = 0; k < m; k++) {
+                if (fxh[k]) {
+                    DWORD code;
+                    WaitForSingleObject(fxh[k], INFINITE);
+                    GetExitCodeProcess(fxh[k], &code);
+                    CloseHandle(fxh[k]);
+                    if (code != 0) errmsg("magick frame pass failed");
+                }
+            }
+            for (k = 0; k < m; k++) free(fxc[k]);
+            free(fxc);
+            free(fxh);
+        }
+        return;
+    }
+    /* Shrink the chunk so the per-chunk command line stays well under the
+     * Windows CreateProcess limit of 32767 chars. */
+    per = strlen(dir) + strlen(cur) + 40;
+    while (chunk > 1 && chunk * per + strlen(args) > 28000)
+        chunk = (chunk + 1) / 2;
     n = (nframes + chunk - 1) / chunk;
     {
         HANDLE *handles = malloc(sizeof(HANDLE) * n);
@@ -532,10 +585,20 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
         for (start = 0, i = 0; start < nframes; start += chunk, i++) {
             int hi = start + chunk - 1;
             if (hi >= nframes) hi = nframes - 1;
-            cmds[i] = malloc(BIG);
-            _snprintf(cmds[i], BIG,
-                      "magick \"%s\\%s_%%05d.png[%d-%d]\" %s -define png:compression-level=1 -scene %d \"%s\\%s_%%05d.png\"",
-                      dir, cur, start, hi, args, start, dir, next);
+            cap = (size_t)(hi - start + 2) * per;
+            char *list = malloc(cap);
+            char *p = list;
+            for (f = start; f <= hi; f++) {
+                int r = _snprintf(p, cap - (size_t)(p - list),
+                                  "\"%s\\%s_%05d.jp2\" ", dir, cur, f);
+                if (r < 0 || (size_t)r >= cap - (size_t)(p - list)) break;
+                p += r;
+            }
+            cmds[i] = malloc(cap + strlen(args) + 256);
+            _snprintf(cmds[i], cap + strlen(args) + 256,
+                      "magick %s %s -quality 100 -scene %d \"%s\\%s_%%05d.jp2\"",
+                      list, args, start, dir, next);
+            free(list);
             if (!hide) printf("[mediaeffects] exec: %s\n", cmds[i]);
             STARTUPINFOA si0;
             PROCESS_INFORMATION pi;
@@ -567,7 +630,7 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
 
 static void video_pass_ffmpeg(const char *dir, const char *cur, const char *next,
                               const char *vf) {
-    run("ffmpeg -y -v error -start_number 0 -i \"%s\\%s_%%05d.png\" -vf \"%s\" -start_number 0 \"%s\\%s_%%05d.png\"",
+    run("ffmpeg -y -v error -start_number 0 -i \"%s\\%s_%%05d.jp2\" -vf \"%s\" -c:v jpeg2000 -compression_level 0 -start_number 0 \"%s\\%s_%%05d.jp2\"",
         dir, cur, vf, dir, next);
 }
 
@@ -606,7 +669,7 @@ static void process_video(void) {
         return;
     }
 
-    run("ffmpeg -y -v error -i \"%s\" -map 0:v -start_number 0 -c:v png \"%s\\f_%%05d.png\"",
+    run("ffmpeg -y -v error -i \"%s\" -map 0:v -start_number 0 -c:v jpeg2000 -compression_level 0 \"%s\\f_%%05d.jp2\"",
         input, tempdir);
 
     {
@@ -626,7 +689,7 @@ static void process_video(void) {
         cur[0] = next[0];
     }
 
-    run("ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.png\" -i \"%s\" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
+    run("ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.jp2\" -i \"%s\" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
         fps, tempdir, cur, input, output);
 }
 
@@ -746,8 +809,8 @@ static void help(void) {
         "\n"
         "Videos whose effects are all expressible as ffmpeg filters are encoded in a\n"
         "single pass with no intermediate files. When ImageMagick is required, frames\n"
-        "are extracted as PNG (lossless), processed in parallel chunks, and reassembled\n"
-        "with ffmpeg.\n"
+        "are extracted as lossless JPEG 2000 (.jp2), processed in parallel chunks, and\n"
+        "reassembled with ffmpeg.\n"
         "\n"
         "Effect source code is generated into the effects/ folder\n"
         "(invert.c, invertlum.c, fisheye.c, hsv.c, hue.c, explode.c, swirl.c, hflip.c,\n"
