@@ -9,8 +9,9 @@
  *
  * Videos whose effects are all expressible as ffmpeg filters are encoded in a
  * single pass with no intermediate frames. When ImageMagick is required, frames
- * are extracted as JPEG, ImageMagick runs on disjoint frame ranges in parallel,
- * and the frames are reassembled with ffmpeg.
+ * are extracted as PNG (lossless, so effects never degrade quality), ImageMagick
+ * runs on disjoint frame ranges in parallel, and the frames are reassembled with
+ * ffmpeg.
  */
 #include <windows.h>
 #include <stdio.h>
@@ -496,7 +497,7 @@ static int count_frames(const char *dir, const char *cur) {
     WIN32_FIND_DATAA fd;
     char pat[MAX_PATH];
     int count = 0;
-    _snprintf(pat, sizeof(pat), "%s\\%s_*.jpg", dir, cur);
+    _snprintf(pat, sizeof(pat), "%s\\%s_*.png", dir, cur);
     HANDLE h = FindFirstFileA(pat, &fd);
     if (h == INVALID_HANDLE_VALUE) return 0;
     do {
@@ -513,7 +514,7 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
     int nframes, cores, chunk, start, n, i;
     nframes = count_frames(dir, cur);
     if (nframes <= 1) {
-        run("magick \"%s\\%s_*.jpg\" %s \"%s\\%s_%%05d.jpg\"", dir, cur, args, dir, next);
+        run("magick \"%s\\%s_*.png\" %s -define png:compression-level=1 \"%s\\%s_%%05d.png\"", dir, cur, args, dir, next);
         return;
     }
     {
@@ -533,7 +534,7 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
             if (hi >= nframes) hi = nframes - 1;
             cmds[i] = malloc(BIG);
             _snprintf(cmds[i], BIG,
-                      "magick \"%s\\%s_%%05d.jpg[%d-%d]\" %s -scene %d \"%s\\%s_%%05d.jpg\"",
+                      "magick \"%s\\%s_%%05d.png[%d-%d]\" %s -define png:compression-level=1 -scene %d \"%s\\%s_%%05d.png\"",
                       dir, cur, start, hi, args, start, dir, next);
             if (!hide) printf("[mediaeffects] exec: %s\n", cmds[i]);
             STARTUPINFOA si0;
@@ -566,7 +567,7 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
 
 static void video_pass_ffmpeg(const char *dir, const char *cur, const char *next,
                               const char *vf) {
-    run("ffmpeg -y -v error -start_number 0 -i \"%s\\%s_%%05d.jpg\" -vf \"%s\" -start_number 0 \"%s\\%s_%%05d.jpg\"",
+    run("ffmpeg -y -v error -start_number 0 -i \"%s\\%s_%%05d.png\" -vf \"%s\" -start_number 0 \"%s\\%s_%%05d.png\"",
         dir, cur, vf, dir, next);
 }
 
@@ -605,7 +606,7 @@ static void process_video(void) {
         return;
     }
 
-    run("ffmpeg -y -v error -i \"%s\" -map 0:v -start_number 0 -c:v mjpeg -q:v 2 \"%s\\f_%%05d.jpg\"",
+    run("ffmpeg -y -v error -i \"%s\" -map 0:v -start_number 0 -c:v png \"%s\\f_%%05d.png\"",
         input, tempdir);
 
     {
@@ -625,7 +626,7 @@ static void process_video(void) {
         cur[0] = next[0];
     }
 
-    run("ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.jpg\" -i \"%s\" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
+    run("ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.png\" -i \"%s\" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
         fps, tempdir, cur, input, output);
 }
 
@@ -745,7 +746,8 @@ static void help(void) {
         "\n"
         "Videos whose effects are all expressible as ffmpeg filters are encoded in a\n"
         "single pass with no intermediate files. When ImageMagick is required, frames\n"
-        "are extracted as JPEG, processed in parallel chunks, and reassembled with ffmpeg.\n"
+        "are extracted as PNG (lossless), processed in parallel chunks, and reassembled\n"
+        "with ffmpeg.\n"
         "\n"
         "Effect source code is generated into the effects/ folder\n"
         "(invert.c, invertlum.c, fisheye.c, hsv.c, hue.c, explode.c, swirl.c, hflip.c,\n"
