@@ -23,6 +23,7 @@
 
 #define MAX_FX 32
 #define BIG 16384
+#define MAX_HUE 32
 
 enum {
     FX_INVERT, FX_INVERTLUM, FX_FISHEYE, FX_HSV, FX_HUE, FX_EXPLODE, FX_SWIRL,
@@ -45,6 +46,11 @@ static int nfx = 0;
 
 static char tempdir[MAX_PATH];
 static char cleanup_dir[MAX_PATH] = "";
+
+static void ensure_hue_lut(const char *ang, char *out, size_t n);
+static int hue_extract(const char *chain, char lut[MAX_HUE][MAX_PATH]);
+static void hue_graph(const char *chain, char *graph, size_t gn, int clutbase);
+static void build_lut_inputs(char *out, size_t n, const char *vf);
 
 static void logmsg(const char *fmt, ...) {
     va_list ap;
@@ -182,7 +188,7 @@ static int uses_ffmpeg(int fx) {
     switch (fx) {
     case FX_INVERT: case FX_BGR: case FX_FISHEYE: case FX_HFLIP: case FX_VFLIP:
     case FX_ROTATE: case FX_STRETCH: case FX_WAVE: case FX_HAAH: case FX_WAAW:
-    case FX_HOOH: case FX_WOOW: case FX_RESIZE:
+    case FX_HOOH: case FX_WOOW: case FX_RESIZE: case FX_HUE:
         return 1;
     default:
         return 0;
@@ -249,6 +255,12 @@ static void append_vf(char *dst, size_t n, int fx, const char *param, const char
     case FX_BGR:
         _snprintf(p, rem, "colorchannelmixer=rr=0:rg=0:rb=1:gr=0:gg=1:gb=0:br=1:bg=0:bb=0");
         break;
+    case FX_HUE: {
+        char lut[MAX_PATH];
+        ensure_hue_lut(param, lut, sizeof(lut));
+        _snprintf(p, rem, "HUE@%s", lut);
+        break;
+    }
     case FX_HAAH:
         _snprintf(p, rem, "crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2");
         break;
@@ -299,10 +311,6 @@ static void append_magick(char *dst, size_t n, int fx, const char *param) {
                   100 + (int)(h * 100 / 180));
         break;
     }
-    case FX_HUE:
-        _snprintf(p, rem, " -colorspace yuv -fx angle=%s*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle)) -colorspace srgb",
-                  param);
-        break;
     case FX_EXPLODE:
         v = atof(param);
         _snprintf(p, rem, " -implode %.4f", -v);
@@ -335,6 +343,98 @@ typedef struct {
 
 static Segment segs[MAX_FX];
 static int nsegs = 0;
+
+/* Build a 6-level HALD LUT (216x216 PPM) that rotates the YUV color plane
+ * by <ang> degrees, using ImageMagick's YUV-space -fx math. The LUT is then
+ * applied with ffmpeg's haldclut filter, which matches the direct fx within
+ * ~0.2% (hald:6, measured RMSE). */
+static void ensure_hue_lut(const char *ang, char *out, size_t n) {
+    _snprintf(out, n, "%s\\ccs_%s.ppm", tempdir, ang);
+    if (GetFileAttributesA(out) != INVALID_FILE_ATTRIBUTES)
+        return;
+    run("magick hald:6 -colorspace yuv -fx \"angle=%s*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))\" -colorspace srgb \"%s\"",
+        ang, out);
+}
+
+/* Collect the LUT paths referenced by "HUE@" markers in a filtergraph in
+ * order. Returns the number of hue effects (== number of extra inputs). */
+static int hue_extract(const char *chain, char lut[MAX_HUE][MAX_PATH]) {
+    int n = 0;
+    const char *m = chain;
+    while (n < MAX_HUE && (m = strstr(m, "HUE@")) != NULL) {
+        const char *end;
+        int len;
+        m += 4;
+        end = strchr(m, ',');
+        len = end ? (int)(end - m) : (int)strlen(m);
+        if (len > 0 && len < MAX_PATH) {
+            memcpy(lut[n], m, (size_t)len);
+            lut[n][len] = 0;
+        } else {
+            lut[n][0] = 0;
+        }
+        n++;
+        m = end ? end : m + len;
+    }
+    return n;
+}
+
+/* Convert a comma-joined ffmpeg filter chain that may contain "HUE@<lut>"
+ * markers into a -filter_complex graph. Each marker becomes a haldclut that
+ * takes its LUT from input clutbase+k (k = marker index), so callers append
+ * the LUTs as extra inputs after their main input(s). A chain without markers
+ * is returned unchanged. The graph always ends "null[vout]" so -map "[vout]"
+ * works regardless of where the last hue sits. */
+static void hue_graph(const char *chain, char *graph, size_t gn, int clutbase) {
+    char cur[64];
+    const char *m, *pending_start;
+    char *p;
+    size_t rem;
+    int k = 0, n = 0;
+    size_t r;
+
+    if (!strstr(chain, "HUE@")) {
+        _snprintf(graph, gn, "%s", chain);
+        return;
+    }
+    _snprintf(cur, sizeof(cur), "[0:v]");
+    p = graph;
+    rem = gn - 1;
+    pending_start = chain;
+    m = chain;
+    while ((m = strstr(m, "HUE@")) != NULL && n < MAX_HUE) {
+        const char *end = strchr(m, ',');
+        size_t plen = (size_t)(m - pending_start);
+        if (plen > 0 && pending_start[plen - 1] == ',')
+            plen--;          /* the comma joining this run to the marker */
+        if (plen > 0) {
+            r = (size_t)_snprintf(p, rem, "%s%.*s[h%d];", cur, (int)plen, pending_start, 2 * k);
+            if (r >= rem) break;
+            p += r; rem -= r;
+            _snprintf(cur, sizeof(cur), "[h%d]", 2 * k);
+        }
+        r = (size_t)_snprintf(p, rem, "%s[%d:v]haldclut[h%d];", cur, clutbase + n, 2 * k + 1);
+        if (r >= rem) break;
+        p += r; rem -= r;
+        _snprintf(cur, sizeof(cur), "[h%d]", 2 * k + 1);
+        k++;
+        n++;
+        if (end) {
+            m = end + 1;
+            pending_start = m;
+        } else {
+            pending_start = chain + strlen(chain);
+            break;
+        }
+    }
+    r = (size_t)_snprintf(p, rem, "%s%.*s", cur, (int)(chain + strlen(chain) - pending_start), pending_start);
+    if (r >= rem) return;
+    p += r; rem -= r;
+    if (chain + strlen(chain) > pending_start)
+        _snprintf(p, rem, ",null[vout]");
+    else
+        _snprintf(p, rem, "null[vout]");
+}
 
 static void build_segments(const char *dims) {
     int i;
@@ -386,7 +486,8 @@ static void write_effect_c(int fx, const char *param) {
         fprintf(f, "/* hsv.c - %s */\nconst char *const mediaeffects_hsv_magick = \"-modulate ...\";\n", param);
         break;
     case FX_HUE:
-        fprintf(f, "/* hue.c - angle %s */\nconst char *const mediaeffects_hue_magick = \"-colorspace yuv -fx ...\";\n", param);
+        fprintf(f, "/* hue.c - angle %s (HALD LUT rotation in YUV color space) */\nconst char *const mediaeffects_hue_vf = \"movie=<ccs_%s.ppm>,[in]haldclut\";\nconst char *const mediaeffects_hue_lut = \"hald:6 -colorspace yuv -fx \\\"angle=%s*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))\\\" -colorspace srgb\";\n",
+                param, param, param);
         break;
     case FX_EXPLODE:
         fprintf(f, "/* explode.c - strength %s */\nconst char *const mediaeffects_explode_magick = \"-implode ...\";\n", param);
@@ -485,7 +586,14 @@ static void process_image(void) {
         logmsg("processing: %s pass %d/%d", segs[i].type ? "magick" : "ffmpeg", i + 1, ns);
         if (segs[i].type == 1)
             run("magick \"%s\" %s \"%s\"", curin, segs[i].arg, curout);
-        else
+        else if (strstr(segs[i].arg, "HUE@")) {
+            char cmd[BIG], luts[BIG], graph[BIG];
+            build_lut_inputs(luts, sizeof(luts), segs[i].arg);
+            hue_graph(segs[i].arg, graph, sizeof(graph), 1);
+            _snprintf(cmd, sizeof(cmd), "ffmpeg -y -v error -i \"%s\"%s -filter_complex \"%s\" -map \"[vout]\" -frames:v 1 \"%s\"",
+                      curin, luts, graph, curout);
+            run("%s", cmd);
+        } else
             run("ffmpeg -y -v error -i \"%s\" -vf \"%s\" \"%s\"", curin, segs[i].arg, curout);
         (void)in; (void)out;
     }
@@ -529,7 +637,7 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
     if (cores > nframes) cores = nframes;
     chunk = (nframes + cores - 1) / cores;
     /* The -fx operator collapses any input sequence to a single output image,
-     * so an fx-based segment (e.g. hue) must run one magick process per frame.
+     * so if a segment ever uses -fx it must run one magick process per frame.
      * Keep the parallel structure by processing frames in waves of `cores`. */
     if (strstr(args, "-fx")) {
         int start, hi, k, m;
@@ -628,10 +736,37 @@ static void video_pass_magick(const char *dir, const char *cur, const char *next
     }
 }
 
+/* Build the " -i \"<lut>\"" argument list for the LUTs referenced by a
+ * filtergraph's "HUE@" markers. */
+static void build_lut_inputs(char *out, size_t n, const char *vf) {
+    char lut[MAX_HUE][MAX_PATH];
+    int nl = hue_extract(vf, lut);
+    int i;
+    size_t len = 0;
+    out[0] = 0;
+    for (i = 0; i < nl; i++) {
+        int r = _snprintf(out + len, n - len, " -i \"%s\"", lut[i]);
+        if (r < 0 || (size_t)r >= n - len) break;
+        len += (size_t)r;
+    }
+}
+
 static void video_pass_ffmpeg(const char *dir, const char *cur, const char *next,
                               const char *vf) {
-    run("ffmpeg -y -v error -start_number 0 -i \"%s\\%s_%%05d.jp2\" -vf \"%s\" -c:v jpeg2000 -compression_level 0 -start_number 0 \"%s\\%s_%%05d.jp2\"",
-        dir, cur, vf, dir, next);
+    char cmd[BIG];
+    if (strstr(vf, "HUE@")) {
+        char luts[BIG], graph[BIG];
+        build_lut_inputs(luts, sizeof(luts), vf);
+        hue_graph(vf, graph, sizeof(graph), 1);
+        _snprintf(cmd, sizeof(cmd),
+            "ffmpeg -y -v error -start_number 0 -i \"%s\\%s_%%05d.jp2\"%s -filter_complex \"%s\" -map \"[vout]\" -c:v jpeg2000 -compression_level 0 -start_number 0 \"%s\\%s_%%05d.jp2\"",
+            dir, cur, luts, graph, dir, next);
+    } else {
+        _snprintf(cmd, sizeof(cmd),
+            "ffmpeg -y -v error -start_number 0 -i \"%s\\%s_%%05d.jp2\" -vf \"%s\" -c:v jpeg2000 -compression_level 0 -start_number 0 \"%s\\%s_%%05d.jp2\"",
+            dir, cur, vf, dir, next);
+    }
+    run("%s", cmd);
 }
 
 static void get_video_fps(const char *vinput, const char *fpsfile, char *fps, size_t n) {
@@ -662,35 +797,82 @@ static void process_video(void) {
     build_segments(dims);
     ns = nsegs;
 
-    /* Fast path: every effect is an ffmpeg filter -> single pass, no frames. */
+    /* Fast path: every effect is an ffmpeg filter -> single pass, no frames.
+     * Hue markers upgrade the command to a -filter_complex with the LUTs as
+     * extra inputs, so hue does not force any intermediate frames either. */
     if (ns == 1 && segs[0].type == 0) {
-        run("ffmpeg -y -v error -i \"%s\" -vf \"%s\" -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
-            input, segs[0].arg, output);
+        char cmd[BIG];
+        if (strstr(segs[0].arg, "HUE@")) {
+            char luts[BIG], graph[BIG];
+            build_lut_inputs(luts, sizeof(luts), segs[0].arg);
+            hue_graph(segs[0].arg, graph, sizeof(graph), 1);
+            _snprintf(cmd, sizeof(cmd),
+                "ffmpeg -y -v error -i \"%s\"%s -filter_complex \"%s\" -map \"[vout]\" -map 0:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
+                input, luts, graph, output);
+        } else {
+            _snprintf(cmd, sizeof(cmd),
+                "ffmpeg -y -v error -i \"%s\" -vf \"%s\" -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
+                input, segs[0].arg, output);
+        }
+        run("%s", cmd);
         return;
     }
 
-    run("ffmpeg -y -v error -i \"%s\" -map 0:v -start_number 0 -c:v jpeg2000 -compression_level 0 \"%s\\f_%%05d.jp2\"",
-        input, tempdir);
-
+    /* Fold a leading ffmpeg segment into extraction and a trailing one into
+     * reassembly so those effects never touch the intermediate frames. */
     {
-        char fpsfile[MAX_PATH];
-        _snprintf(fpsfile, sizeof(fpsfile), "%s\\fps.txt", tempdir);
-        get_video_fps(input, fpsfile, fps, sizeof(fps));
-    }
+        int first = 0, last = ns;
+        const char *fold_first = NULL, *fold_last = NULL;
+        if (segs[0].type == 0) { fold_first = segs[0].arg; first = 1; }
+        if (segs[ns - 1].type == 0) { fold_last = segs[ns - 1].arg; last = ns - 1; }
 
-    for (i = 0; i < ns; i++) {
-        const char *cnext = (strcmp(cur, "a") == 0) ? "b" : "a";
-        next = (char *)cnext;
-        logmsg("processing: %s pass %d/%d", segs[i].type ? "magick" : "ffmpeg", i + 1, ns);
-        if (segs[i].type == 1)
-            video_pass_magick(tempdir, cur, next, segs[i].arg);
+        if (fold_first && strstr(fold_first, "HUE@")) {
+            char cmd[BIG], luts[BIG], graph[BIG];
+            build_lut_inputs(luts, sizeof(luts), fold_first);
+            hue_graph(fold_first, graph, sizeof(graph), 1);
+            _snprintf(cmd, sizeof(cmd),
+                "ffmpeg -y -v error -i \"%s\"%s -filter_complex \"%s\" -map \"[vout]\" -start_number 0 -c:v jpeg2000 -compression_level 0 \"%s\\f_%%05d.jp2\"",
+                input, luts, graph, tempdir);
+            run("%s", cmd);
+        } else if (fold_first)
+            run("ffmpeg -y -v error -i \"%s\" -map 0:v -start_number 0 -vf \"%s\" -c:v jpeg2000 -compression_level 0 \"%s\\f_%%05d.jp2\"",
+                input, fold_first, tempdir);
         else
-            video_pass_ffmpeg(tempdir, cur, next, segs[i].arg);
-        cur[0] = next[0];
-    }
+            run("ffmpeg -y -v error -i \"%s\" -map 0:v -start_number 0 -c:v jpeg2000 -compression_level 0 \"%s\\f_%%05d.jp2\"",
+                input, tempdir);
 
-    run("ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.jp2\" -i \"%s\" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
-        fps, tempdir, cur, input, output);
+        {
+            char fpsfile[MAX_PATH];
+            _snprintf(fpsfile, sizeof(fpsfile), "%s\\fps.txt", tempdir);
+            get_video_fps(input, fpsfile, fps, sizeof(fps));
+        }
+
+        for (i = first; i < last; i++) {
+            const char *cnext = (strcmp(cur, "a") == 0) ? "b" : "a";
+            next = (char *)cnext;
+            logmsg("processing: %s pass %d/%d", segs[i].type ? "magick" : "ffmpeg", i + 1, ns);
+            if (segs[i].type == 1)
+                video_pass_magick(tempdir, cur, next, segs[i].arg);
+            else
+                video_pass_ffmpeg(tempdir, cur, next, segs[i].arg);
+            cur[0] = next[0];
+        }
+
+        if (fold_last && strstr(fold_last, "HUE@")) {
+            char cmd[BIG], luts[BIG], graph[BIG];
+            build_lut_inputs(luts, sizeof(luts), fold_last);
+            hue_graph(fold_last, graph, sizeof(graph), 2);
+            _snprintf(cmd, sizeof(cmd),
+                "ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.jp2\" -i \"%s\"%s -filter_complex \"%s\" -map \"[vout]\" -map 1:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
+                fps, tempdir, cur, input, luts, graph, output);
+            run("%s", cmd);
+        } else if (fold_last)
+            run("ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.jp2\" -i \"%s\" -map 0:v -map 1:a? -vf \"%s\" -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
+                fps, tempdir, cur, input, fold_last, output);
+        else
+            run("ffmpeg -y -v error -r %s -start_number 0 -i \"%s\\%s_%%05d.jp2\" -i \"%s\" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 128k \"%s\"",
+                fps, tempdir, cur, input, output);
+    }
 }
 
 /* ---- argument parsing --------------------------------------------------- */
@@ -775,8 +957,9 @@ static void help(void) {
         "  --hsv H,S,V           Hue shift in degrees, saturation and value shifts\n"
         "                        (0 = no change). e.g. --hsv 180,0,0\n"
         "                        (ImageMagick -modulate style)\n"
-        "  --hue [degrees]       Rotate hue in degrees, default 90 (ImageMagick\n"
-        "                        -colorspace yuv -fx channel rotation style)\n"
+        "  --hue [degrees]       Rotate hue in degrees, default 90 (HALD LUT\n"
+        "                        rotation of the YUV color plane, ImageMagick\n"
+        "                        fx + ffmpeg haldclut style)\n"
         "  --explode [strength]  Explode outward, default 1.0 (-implode style)\n"
         "  --swirl [strength]    Swirl in degrees, default 45 (-swirl style)\n"
         "  --hflip               Mirror horizontally (ffmpeg -vf hflip)\n"
