@@ -62,7 +62,7 @@ add_fx() { FX_TYPES+=("$1"); FX_PARAMS+=("${2:-}"); }
 # effect is in this set, videos are processed with a single ffmpeg command and
 # no intermediate frames are written at all.
 uses_ffmpeg() {
-    case "$1" in invert|bgr|fisheye|hflip|vflip|rotate|stretch|wave|haah|waaw|hooh|woow|resize) return 0;; esac
+    case "$1" in invert|bgr|fisheye|hflip|vflip|rotate|stretch|wave|haah|waaw|hooh|woow|resize|hue) return 0;; esac
     return 1
 }
 
@@ -81,8 +81,9 @@ Effects:
   --hsv H,S,V           Hue shift in degrees, saturation and value shifts
                         (0 = no change). e.g. --hsv 180,0,0
                         (ImageMagick -modulate style)
-  --hue [degrees]       Rotate hue in degrees, default 90 (ImageMagick
-                        -colorspace yuv -fx channel rotation style)
+  --hue [degrees]       Rotate hue in degrees, default 90 (HALD LUT
+                        rotation of the YUV color plane, ImageMagick fx
+                        + ffmpeg haldclut style)
   --explode [strength]  Explode outward, default 1.0 (-implode style)
   --swirl [strength]    Swirl in degrees, default 45 (-swirl style)
   --hflip               Mirror horizontally (ffmpeg -vf hflip)
@@ -205,6 +206,7 @@ ffmpeg_vf() {
         stretch) stretch_vf "$2" "$3";;
         wave) wave_vf "$2" "$3";;
         bgr) echo "colorchannelmixer=rr=0:rg=0:rb=1:gr=0:gg=1:gb=0:br=1:bg=0:bb=0";;
+        hue) echo "hue=h=${2}";;
         haah) echo "crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2";;
         waaw) echo "hflip,crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2";;
         hooh) echo "transpose=1,crop=iw/2:ih:0:0,split[a][b];[b]hflip[c];[a][c]hstack=inputs=2,transpose=2";;
@@ -231,7 +233,6 @@ magick_arg() {
                 'BEGIN { printf "%d %d %d", 100+v, 100+s, 100 + h*100/180 }')"
             echo " -modulate $vp,$sp,$hp"
             ;;
-        hue) echo " -colorspace yuv -fx angle=${2}*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle)) -colorspace srgb";;
         explode) echo " -implode $(awk -v a="$2" 'BEGIN { printf "%.4f", -a }')";;
         swirl) echo " -swirl $2";;
         magik) echo " -liquid-rescale 50%x50% -resize 200%";;
@@ -240,17 +241,92 @@ magick_arg() {
     esac
 }
 
+# Generate a 6-level HALD LUT (216x216 PPM) that rotates the YUV color plane
+# by <ang> degrees (ImageMagick YUV-space -fx). Applied with ffmpeg haldclut.
+make_hue_lut() {
+    local ang="$1" out="$2"
+    [ -f "$out" ] && return
+    run magick hald:6 -colorspace yuv \
+        -fx "angle=${ang}*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))" \
+        -colorspace srgb "$out"
+}
+
+# " -i <lut>" arguments for every HUE@ marker in a chain, in order. The LUT
+# paths are POSIX-style (no spaces) and unquoted so MSYS can translate them.
+hue_luts() {
+    local chain="$1" out="" f
+    IFS=, read -r -a frags <<< "$chain"
+    for f in "${frags[@]}"; do
+        [[ "$f" == HUE@* ]] && out+=" -i ${f#HUE@}"
+    done
+    echo "$out"
+}
+
+# Turn a comma-joined chain containing HUE@ markers into a -filter_complex
+# graph. Marker k uses input clutbase+k as its LUT. Always ends null[vout].
+hue_graph() {
+    local chain="$1" clutbase="$2" out="" cur="[0:v]" pending="" k=0 n=0 f
+    IFS=, read -r -a frags <<< "$chain"
+    for f in "${frags[@]}"; do
+        if [[ "$f" == HUE@* ]]; then
+            if [ -n "$pending" ]; then
+                out+="${cur}${pending}[h$((2 * k))];"
+                cur="[h$((2 * k))]"
+            fi
+            out+="${cur}[$((clutbase + n)):v]haldclut[h$((2 * k + 1))];"
+            cur="[h$((2 * k + 1))]"
+            k=$((k + 1)); n=$((n + 1)); pending=""
+        else
+            if [ -n "$pending" ]; then pending+=",$f"; else pending="$f"; fi
+        fi
+    done
+    if [ -n "$pending" ]; then
+        out+="${cur}${pending},null[vout]"
+    else
+        out+="${cur}null[vout]"
+    fi
+    echo "$out"
+}
+
+# Run one ffmpeg frame pass for a segment argument that may contain HUE@
+# markers (upgrading to -filter_complex with the LUTs as extra inputs).
+video_pass_ffmpeg() {
+    local dir="$1" cur="$2" next="$3" vf="$4" graph luts
+    if [[ "$vf" == *HUE@* ]]; then
+        luts=$(hue_luts "$vf")
+        graph=$(hue_graph "$vf" 1)
+        run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" $luts \
+            -filter_complex "$graph" -map "[vout]" \
+            -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS -start_number 0 "$dir/${next}_%05d.$FRAME_EXT"
+    else
+        run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" -vf "$vf" \
+            -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS -start_number 0 "$dir/${next}_%05d.$FRAME_EXT"
+    fi
+}
+
 # Group consecutive effects into segments of one kind ("ffmpeg" or "magick").
 # Consecutive ffmpeg effects are merged into a single filtergraph and
 # consecutive magick effects into a single ImageMagick command, so each pass
-# decodes/encodes the frames only once per kind switch.
+# decodes/encodes the frames only once per kind switch. Hue merges into the
+# ffmpeg chain as a "HUE@<lut>" marker: at command-build time the chain is
+# upgraded to a -filter_complex that feeds the LUT as an extra input, so hue
+# never forces an extra frame pass.
 SEG_TYPES=()
 SEG_ARGS=()
 build_segments() {
     local dims="$1" n=${#FX_TYPES[@]} i cur="" vf marg
     SEG_TYPES=(); SEG_ARGS=()
     for ((i = 0; i < n; i++)); do
-        if uses_ffmpeg "${FX_TYPES[$i]}"; then
+        if [ "${FX_TYPES[$i]}" = hue ]; then
+            [ -n "$CLEANUP" ] || CLEANUP=$(mktemp -d)
+            make_hue_lut "${FX_PARAMS[$i]}" "$CLEANUP/ccs_${FX_PARAMS[$i]}.ppm"
+            vf="HUE@$CLEANUP/ccs_${FX_PARAMS[$i]}.ppm"
+            if [ "$cur" = ffmpeg ]; then
+                SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]="${SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]},$vf"
+            else
+                cur=ffmpeg; SEG_TYPES+=("ffmpeg"); SEG_ARGS+=("$vf")
+            fi
+        elif uses_ffmpeg "${FX_TYPES[$i]}"; then
             vf=$(ffmpeg_vf "${FX_TYPES[$i]}" "${FX_PARAMS[$i]}" "$dims")
             if [ "$cur" = ffmpeg ]; then
                 SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]="${SEG_ARGS[$(( ${#SEG_ARGS[@]} - 1 ))]},$vf"
@@ -375,17 +451,28 @@ EOF
  * Angle       : $p degrees
  * Generated by: mediaeffects
  *
- * CLI equivalent:
- *   magick <input> -colorspace yuv -fx "angle=$p*pi/180; channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))" -colorspace srgb <output>
+ * The hue rotation is a rotation of the color plane in YUV space, applied
+ * through a 6-level HALD LUT built with ImageMagick's -fx math. This keeps
+ * the effect chroma rotation in YUV space (same as ffmpeg's hue filter, which
+ * operates in HSV) while matching the reference ImageMagick implementation.
  *
- * Style reference: ImageMagick -colorspace, -fx channel rotation
+ * CLI equivalents:
+ *   # two-input haldclut (portable, used by mediaeffects):
+ *   magick hald:6 -colorspace yuv \\
+ *     -fx "angle=${p}*pi/180;channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))" \\
+ *     -colorspace srgb ccs_${p}.ppm
+ *   ffmpeg -i <input> -i ccs_${p}.ppm \\
+ *     -filter_complex "[0:v][1:v]haldclut[vout]" -map "[vout]" <output>
+ *   # single-input -vf form (POSIX paths only):
+ *   ffmpeg -i <input> -vf "movie=ccs_${p}.ppm,[in]haldclut" <output>
+ *
+ * Style reference: ImageMagick -fx YUV color-plane rotation
  */
 
 #include <stddef.h>
 
-/* ImageMagick option string (rotate UV chroma around luma) */
-const char *const mediaeffects_hue_magick =
-    "-colorspace yuv -fx \"angle=$p*pi/180; channel(u,.5+(u.g-.5)*cos(angle)-(u.b-.5)*sin(angle),.5+(u.g-.5)*sin(angle)+(u.b-.5)*cos(angle))\" -colorspace srgb";
+/* ffmpeg filter string (requires the HALD LUT as a second input) */
+const char *const mediaeffects_hue_vf = "[0:v][1:v]haldclut";
 EOF
             ;;
         explode)
@@ -743,7 +830,13 @@ process_image() {
             # shellcheck disable=SC2086
             run magick "$in" ${SEG_ARGS[$i]} "$out"
         else
-            run ffmpeg -y -v error -i "$in" -vf "${SEG_ARGS[$i]}" "$out"
+            if [[ "${SEG_ARGS[$i]}" == *HUE@* ]]; then
+                run ffmpeg -y -v error -i "$in" $(hue_luts "${SEG_ARGS[$i]}") \
+                    -filter_complex "$(hue_graph "${SEG_ARGS[$i]}" 1)" -map "[vout]" \
+                    -frames:v 1 "$out"
+            else
+                run ffmpeg -y -v error -i "$in" -vf "${SEG_ARGS[$i]}" "$out"
+            fi
         fi
         in="$out"
     done
@@ -793,7 +886,7 @@ video_pass_magick() {
     [ "$cores" -gt "$nframes" ] && cores=$nframes
     if [[ "$args" == *-fx* ]]; then
         # The -fx operator collapses any input sequence to a single output
-        # image, so an fx-based segment (e.g. hue) must run one magick per
+        # image, so an fx-based segment must run one magick per
         # frame. Keep the parallel structure by processing frames in waves of
         # at most $cores.
         for ((start = 0; start < nframes; start += cores)); do
@@ -839,14 +932,8 @@ video_pass_magick() {
     [ "$status" -eq 0 ] || err "magick frame pass failed"
 }
 
-video_pass_ffmpeg() {
-    local dir="$1" cur="$2" next="$3" vf="$4"
-    run ffmpeg -y -v error -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" -vf "$vf" \
-        -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS -start_number 0 "$dir/${next}_%05d.$FRAME_EXT"
-}
-
 process_video() {
-    local dir fps dims cur=f next i ns
+    local dir fps dims cur=f next i ns last
     if [ "${#FX_TYPES[@]}" -eq 0 ]; then
         run ffmpeg -y -v error -i "$INPUT" -map 0:v -map 0:a? -c copy "$OUTPUT"
         return
@@ -858,23 +945,47 @@ process_video() {
     ns=${#SEG_TYPES[@]}
 
     # Fast path: every effect is an ffmpeg filter, so do it in one pass with no
-    # intermediate frames at all.
+    # intermediate frames at all. Hue markers upgrade to -filter_complex, so they
+    # still cost only a single frame pass.
     if [ "$ns" -eq 1 ] && [ "${SEG_TYPES[0]}" = ffmpeg ]; then
-        run ffmpeg -y -v error -i "$INPUT" -vf "${SEG_ARGS[0]}" \
-            -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
-            -c:a aac -b:a 128k "$OUTPUT"
+        if [[ "${SEG_ARGS[0]}" == *HUE@* ]]; then
+            run ffmpeg -y -v error -i "$INPUT" $(hue_luts "${SEG_ARGS[0]}") \
+                -filter_complex "$(hue_graph "${SEG_ARGS[0]}" 1)" -map "[vout]" -map 0:a? \
+                -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
+                -c:a aac -b:a 128k "$OUTPUT"
+        else
+            run ffmpeg -y -v error -i "$INPUT" -vf "${SEG_ARGS[0]}" \
+                -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
+                -c:a aac -b:a 128k "$OUTPUT"
+        fi
         return
     fi
 
     detect_frame_format
 
-    CLEANUP=$(mktemp -d)
+    [ -n "$CLEANUP" ] || CLEANUP=$(mktemp -d)
     dir="$CLEANUP"
-    run ffmpeg -y -v error -i "$INPUT" -map 0:v -start_number 0 -c:v "$FRAME_CODEC" \
-        $FRAME_CODEC_OPTS "$dir/f_%05d.$FRAME_EXT"
+
+    # Fold a leading ffmpeg segment into extraction and a trailing one into
+    # reassembly so those effects never touch the intermediate frames.
+    local first=0 last=$ns fold_first="" fold_last=""
+    if [ "${SEG_TYPES[0]}" = ffmpeg ]; then fold_first="${SEG_ARGS[0]}"; first=1; fi
+    if [ "${SEG_TYPES[$((ns - 1))]}" = ffmpeg ]; then fold_last="${SEG_ARGS[$((ns - 1))]}"; last=$((ns - 1)); fi
+
+    if [[ "$fold_first" == *HUE@* ]]; then
+        run ffmpeg -y -v error -i "$INPUT" $(hue_luts "$fold_first") \
+            -filter_complex "$(hue_graph "$fold_first" 1)" -map "[vout]" \
+            -start_number 0 -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS "$dir/f_%05d.$FRAME_EXT"
+    elif [ -n "$fold_first" ]; then
+        run ffmpeg -y -v error -i "$INPUT" -map 0:v -start_number 0 -vf "$fold_first" \
+            -c:v "$FRAME_CODEC" $FRAME_CODEC_OPTS "$dir/f_%05d.$FRAME_EXT"
+    else
+        run ffmpeg -y -v error -i "$INPUT" -map 0:v -start_number 0 -c:v "$FRAME_CODEC" \
+            $FRAME_CODEC_OPTS "$dir/f_%05d.$FRAME_EXT"
+    fi
     fps=$(get_video_fps "$INPUT")
 
-    for ((i = 0; i < ns; i++)); do
+    for ((i = first; i < last; i++)); do
         next=$( [ "$cur" = a ] && echo b || echo a )
         log "processing: ${SEG_TYPES[$i]} pass $((i + 1))/$ns"
         if [ "${SEG_TYPES[$i]}" = magick ]; then
@@ -885,9 +996,23 @@ process_video() {
         cur="$next"
     done
 
-    run ffmpeg -y -v error -r "$fps" -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" \
-        -i "$INPUT" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast \
-        -pix_fmt yuv420p -c:a aac -b:a 128k "$OUTPUT"
+    if [[ "$fold_last" == *HUE@* ]]; then
+        # Inputs: 0 = final frames, 1 = original (audio), 2+ = LUTs.
+        run ffmpeg -y -v error -r "$fps" -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" \
+            -i "$INPUT" $(hue_luts "$fold_last") \
+            -filter_complex "$(hue_graph "$fold_last" 2)" -map "[vout]" -map 1:a? \
+            -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
+            -c:a aac -b:a 128k "$OUTPUT"
+    elif [ -n "$fold_last" ]; then
+        run ffmpeg -y -v error -r "$fps" -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" \
+            -i "$INPUT" -map 0:v -map 1:a? -vf "$fold_last" \
+            -c:v libx264 -crf 18 -preset veryfast -pix_fmt yuv420p \
+            -c:a aac -b:a 128k "$OUTPUT"
+    else
+        run ffmpeg -y -v error -r "$fps" -start_number 0 -i "$dir/${cur}_%05d.$FRAME_EXT" \
+            -i "$INPUT" -map 0:v -map 1:a? -c:v libx264 -crf 18 -preset veryfast \
+            -pix_fmt yuv420p -c:a aac -b:a 128k "$OUTPUT"
+    fi
 }
 
 parse_args() {
